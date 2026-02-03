@@ -1,0 +1,729 @@
+$schema: https://schemas.humio.com/dashboard/v0.20.0
+name: TeamViewer Usage & Decommissioning Tracker
+updateFrequency: never
+timeSelector:
+  end: now
+  start: 7d
+sharedTimeInterval:
+  enabled: true
+  isLive: false
+  start: 7d
+
+# Interactive Parameters for Filtering
+parameters:
+  ComputerName:
+    label: Computer Name
+    query: |
+      #event_simpleName=ProcessRollup2 
+      | FileName=/(teamviewer|tv_w32|tv_x64)\.exe/i
+      | groupBy(ComputerName)
+    timeInterval: 7d
+    useDashboardTimeIfSet: true
+    type: query
+    defaultValue: '*'
+    width: 2
+    order: 1
+    valueField: ComputerName
+  
+  UserName:
+    label: User Name
+    query: |
+      #event_simpleName=ProcessRollup2 
+      | FileName=/(teamviewer|tv_w32|tv_x64)\.exe/i
+      | groupBy(UserName)
+    timeInterval: 7d
+    useDashboardTimeIfSet: true
+    type: query
+    defaultValue: '*'
+    width: 2
+    order: 2
+    valueField: UserName
+  
+  UsageStatus:
+    label: Usage Status
+    type: text
+    defaultValue: '*'
+    width: 2
+    order: 3
+    options:
+      - label: All
+        value: '*'
+      - label: Active Usage Only
+        value: 'Active'
+      - label: Installed Only (No Activity)
+        value: 'Installed Only'
+
+# Dashboard Sections
+sections:
+  section-overview:
+    collapsed: false
+    order: 1
+    title: "📊 Executive Summary - Last 7 Days"
+    widgetIds:
+      - note-instructions
+      - widget-active-hosts-count
+      - widget-active-users-count
+      - widget-total-sessions-count
+      - widget-hosts-by-status
+      - widget-usage-trend
+      - widget-top-users
+
+  section-active-sessions:
+    collapsed: false
+    order: 2
+    title: "🔴 Active TeamViewer Sessions"
+    widgetIds:
+      - widget-active-sessions-detail
+      - widget-network-connections
+      - widget-dns-activity
+
+  section-installation-analysis:
+    collapsed: false
+    order: 3
+    title: "💾 Installation vs. Active Usage Analysis"
+    widgetIds:
+      - widget-installation-vs-usage
+      - widget-inactive-installations
+
+  section-weekly-report:
+    collapsed: false
+    order: 4
+    title: "📅 Weekly Usage Report"
+    widgetIds:
+      - widget-daily-usage-summary
+      - widget-user-activity-heatmap
+
+  section-investigation:
+    collapsed: false
+    order: 5
+    title: "🔍 Investigation & Remediation Tools"
+    widgetIds:
+      - widget-process-prevalence
+      - widget-outreach-list
+
+# Dashboard Widgets
+widgets:
+  
+  # ========================================
+  # SECTION: INSTRUCTIONS NOTE
+  # ========================================
+  
+  note-instructions:
+    x: 0
+    y: 0
+    height: 3
+    width: 12
+    type: note
+    title: "📋 Dashboard Usage Instructions"
+    text: |
+      ## TeamViewer Decommissioning Dashboard
+      
+      **Purpose:** Track TeamViewer usage across the enterprise to support migration to the new RMM solution.
+      
+      **Key Metrics:**
+      - **Active Sessions**: Systems with both TeamViewer execution AND network activity
+      - **Installed Only**: Systems with TeamViewer installed but no recent network activity
+      - **Usage Status Filter**: Use dropdown to focus on specific categories
+      
+      **Weekly Workflow:**
+      1. Review "Executive Summary" for high-level metrics
+      2. Check "Active TeamViewer Sessions" for current usage
+      3. Export "User Outreach List" to contact active users
+      4. Monitor "Weekly Usage Report" to track migration progress
+      
+      **Time Range:** Default is 7 days. Adjust using the time selector above.
+      
+      ---
+      *Dashboard updates automatically. Last generated: Use refresh to update data.*
+
+  # ========================================
+  # SECTION: EXECUTIVE SUMMARY
+  # ========================================
+  
+  widget-active-hosts-count:
+    x: 0
+    y: 3
+    height: 3
+    width: 3
+    type: query
+    title: "Active Hosts (7d)"
+    queryString: |
+      #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/ event_platform=Win
+      | FileName=/(teamviewer|tv_w32|tv_x64)\.exe/i
+      | ComputerName=~wildcard(?ComputerName, ignoreCase=true)
+      | falconPID:=TargetProcessId | falconPID:=ContextProcessId
+      | selfJoinFilter(field=[aid, falconPID], where=[
+          {#event_simpleName=ProcessRollup2}, 
+          {#event_simpleName=NetworkConnectIP4}
+        ])
+      | groupBy([aid], limit=max)
+      | count(aid, as=activeHosts)
+    visualization: single-value
+    options:
+      default-color-value: '#29a34bff'
+    isLive: false
+  
+  widget-active-users-count:
+    x: 3
+    y: 3
+    height: 3
+    width: 3
+    type: query
+    title: "Active Users (7d)"
+    queryString: |
+      #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/ event_platform=Win
+      | FileName=/(teamviewer|tv_w32|tv_x64)\.exe/i
+      | UserName=~wildcard(?UserName, ignoreCase=true)
+      | falconPID:=TargetProcessId | falconPID:=ContextProcessId
+      | selfJoinFilter(field=[aid, falconPID], where=[
+          {#event_simpleName=ProcessRollup2}, 
+          {#event_simpleName=NetworkConnectIP4}
+        ])
+      | groupBy([UserName], limit=max)
+      | count(UserName, as=activeUsers)
+    visualization: single-value
+    options:
+      default-color-value: '#f59464ff'
+    isLive: false
+  
+  widget-total-sessions-count:
+    x: 6
+    y: 3
+    height: 3
+    width: 3
+    type: query
+    title: "Total Connection Events"
+    queryString: |
+      #event_simpleName=NetworkConnectIP4 event_platform=Win
+      | join({
+          #event_simpleName=ProcessRollup2 
+          | FileName=/(teamviewer|tv_w32|tv_x64)\.exe/i
+        }, key=TargetProcessId, field=ContextProcessId, include=[FileName])
+      | FileName=*
+      | count(aid, as=totalConnections)
+    visualization: single-value
+    options:
+      default-color-value: '#126CC6FF'
+    isLive: false
+  
+  widget-hosts-by-status:
+    x: 9
+    y: 3
+    height: 3
+    width: 3
+    type: query
+    title: "Hosts by Usage Status"
+    queryString: |
+      // Find all hosts with TeamViewer installed
+      #event_simpleName=ProcessRollup2 
+      | FileName=/(teamviewer|tv_w32|tv_x64)\.exe/i
+      | ComputerName=~wildcard(?ComputerName, ignoreCase=true)
+      | groupBy([aid, ComputerName], limit=max)
+      | installation:="Installed"
+      
+      // Check for network activity
+      | join({
+          #event_simpleName=NetworkConnectIP4
+          | join({
+              #event_simpleName=ProcessRollup2 
+              | FileName=/(teamviewer|tv_w32|tv_x64)\.exe/i
+            }, key=TargetProcessId, field=ContextProcessId, include=[FileName])
+          | FileName=*
+          | groupBy([aid], function=count(aid, as=activeConnections))
+          | activeUsage:="Active"
+        }, field=aid, include=[activeUsage, activeConnections], mode=left)
+      
+      // Categorize status
+      | case {
+          activeUsage="Active" | status:="✓ Actively Used";
+          installation="Installed" | status:="⚠ Installed Only";
+          * | status:="Unknown";
+      }
+      
+      // Aggregate by status
+      | groupBy([status], function=count(aid, as=hostCount))
+    visualization: pie-chart
+    options:
+      legendPosition: right
+      withLegendTitle: false
+    isLive: false
+  
+  widget-usage-trend:
+    x: 0
+    y: 6
+    height: 4
+    width: 8
+    type: query
+    title: "TeamViewer Activity Trend (Hourly)"
+    queryString: |
+      #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/ event_platform=Win
+      | FileName=/(teamviewer|tv_w32|tv_x64)\.exe/i
+      | ComputerName=~wildcard(?ComputerName, ignoreCase=true)
+      | UserName=~wildcard(?UserName, ignoreCase=true)
+      | falconPID:=TargetProcessId | falconPID:=ContextProcessId
+      | selfJoinFilter(field=[aid, falconPID], where=[
+          {#event_simpleName=ProcessRollup2}, 
+          {#event_simpleName=NetworkConnectIP4}
+        ])
+      | timechart(span=1h, function=count(aid, distinct=true, as=activeHosts))
+    visualization: time-chart
+    options:
+      connect-points: true
+      imputation: none
+      yAxisScale: linear
+    isLive: false
+  
+  widget-top-users:
+    x: 8
+    y: 6
+    height: 4
+    width: 4
+    type: query
+    title: "Top 10 Users by Activity"
+    queryString: |
+      #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/ event_platform=Win
+      | FileName=/(teamviewer|tv_w32|tv_x64)\.exe/i
+      | UserName=~wildcard(?UserName, ignoreCase=true)
+      | falconPID:=TargetProcessId | falconPID:=ContextProcessId
+      | selfJoinFilter(field=[aid, falconPID], where=[
+          {#event_simpleName=ProcessRollup2}, 
+          {#event_simpleName=NetworkConnectIP4}
+        ])
+      | groupBy([UserName], function=count(aid, as=activityCount), limit=10)
+      | sort(activityCount, order=desc)
+    visualization: bar-chart
+    options:
+      legendPosition: none
+    isLive: false
+
+  # ========================================
+  # SECTION: ACTIVE SESSIONS
+  # ========================================
+  
+  widget-active-sessions-detail:
+    x: 0
+    y: 0
+    height: 5
+    width: 12
+    type: query
+    title: "Active TeamViewer Sessions - Detailed View"
+    queryString: |
+      #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/ event_platform=Win
+      | FileName=/(teamviewer|tv_w32|tv_x64)\.exe/i
+      | ComputerName=~wildcard(?ComputerName, ignoreCase=true)
+      | UserName=~wildcard(?UserName, ignoreCase=true)
+      | falconPID:=TargetProcessId | falconPID:=ContextProcessId
+      | selfJoinFilter(field=[aid, falconPID], where=[
+          {#event_simpleName=ProcessRollup2}, 
+          {#event_simpleName=NetworkConnectIP4}
+        ])
+      | groupBy([aid, ComputerName, falconPID, UserName], function=([
+          collect([FileName, CommandLine], limit=1), 
+          count(RemoteAddressIP4, distinct=true, as=uniqueRemoteIPs),
+          collect([RemoteAddressIP4, RemotePort], separator=" | ", limit=10),
+          min(@timestamp, as=firstSeen),
+          max(@timestamp, as=lastSeen),
+          count(aid, as=eventCount)
+        ]), limit=max)
+      | FileName=* RemoteAddressIP4=*
+      | firstSeen:=formatTime(field=firstSeen, format="%Y-%m-%d %H:%M:%S")
+      | lastSeen:=formatTime(field=lastSeen, format="%Y-%m-%d %H:%M:%S")
+      | RTR:=format("[RTR Console](https://falcon.crowdstrike.com/activity/real-time-response/console/?aid=%s)", field=[aid])
+      | ProcessExplorer:=format("[Investigate](https://falcon.crowdstrike.com/investigate/process-explorer/%s/%s)", field=[aid, falconPID])
+      | sort(lastSeen, order=desc)
+      | rename([[aid, "Agent ID"], [uniqueRemoteIPs, "Unique IPs"], [eventCount, "Events"]])
+      | table(["Agent ID", ComputerName, UserName, FileName, "Unique IPs", RemoteAddressIP4, firstSeen, lastSeen, "Events", RTR, ProcessExplorer])
+    visualization: table-view
+    options:
+      cell-overflow: wrap-text
+      row-numbers-enabled: true
+      configured-columns:
+        Events:
+          color:
+            conditions:
+              - color: '#C93637'
+                condition:
+                  arg: 50
+                  type: GreaterThan
+              - color: '#f59464ff'
+                condition:
+                  arg: 20
+                  type: GreaterThan
+            defaultColor: '#29a34bff'
+    isLive: false
+  
+  widget-network-connections:
+    x: 0
+    y: 5
+    height: 5
+    width: 6
+    type: query
+    title: "TeamViewer Network Connections (Inbound/Outbound)"
+    queryString: |
+      #event_simpleName=NetworkConnectIP4 event_platform=Win
+      | ComputerName=~wildcard(?ComputerName, ignoreCase=true)
+      | join({
+          #event_simpleName=ProcessRollup2 
+          | FileName=/(teamviewer|tv_w32|tv_x64)\.exe/i
+        }, key=TargetProcessId, field=ContextProcessId, 
+        include=[FileName, CommandLine, UserName, ImageFileName])
+      | FileName=*
+      | !cidr(RemoteAddressIP4, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"])
+      | case {
+          RemotePort=5938 | Direction:="⬇ Inbound";
+          LocalPort=5938 | Direction:="⬆ Outbound";
+          * | Direction:="↔ Unknown";
+      }
+      | groupBy([aid, ComputerName, UserName, RemoteAddressIP4, Direction], function=([
+          collect([FileName, LocalPort, RemotePort], limit=3),
+          count(aid, as=connectionCount),
+          min(@timestamp, as=firstConnection),
+          max(@timestamp, as=lastConnection)
+        ]), limit=max)
+      | firstConnection:=formatTime(field=firstConnection, format="%m-%d %H:%M")
+      | lastConnection:=formatTime(field=lastConnection, format="%m-%d %H:%M")
+      | sort(lastConnection, order=desc)
+      | table([ComputerName, UserName, RemoteAddressIP4, Direction, connectionCount, firstConnection, lastConnection])
+    visualization: table-view
+    options:
+      cell-overflow: wrap-text
+      row-numbers-enabled: true
+    isLive: false
+  
+  widget-dns-activity:
+    x: 6
+    y: 5
+    height: 5
+    width: 6
+    type: query
+    title: "TeamViewer DNS Activity"
+    queryString: |
+      #event_simpleName=DnsRequest
+      | DomainName=/teamviewer\.com|tvc\.teamviewer\.com|master\d+\.teamviewer\.com/i
+      | ComputerName=~wildcard(?ComputerName, ignoreCase=true)
+      | join({
+          #event_simpleName=ProcessRollup2 
+          | FileName=/(teamviewer|tv_w32|tv_x64)\.exe/i
+          | ImageFileName=/(\\|\/)(?<FileName>[^\\\/]+)$/
+        }, key=TargetProcessId, field=ContextProcessId, 
+        include=[ImageFileName, CommandLine, UserName], mode=left)
+      | groupBy([aid, ComputerName, UserName], function=([
+          collect([DomainName], separator=", ", limit=10),
+          count(DomainName, as=dnsRequestCount),
+          min(@timestamp, as=firstRequest),
+          max(@timestamp, as=lastRequest)
+        ]), limit=max)
+      | firstRequest:=formatTime(field=firstRequest, format="%Y-%m-%d %H:%M:%S")
+      | lastRequest:=formatTime(field=lastRequest, format="%Y-%m-%d %H:%M:%S")
+      | sort(lastRequest, order=desc)
+      | table([ComputerName, UserName, DomainName, dnsRequestCount, firstRequest, lastRequest])
+    visualization: table-view
+    options:
+      cell-overflow: wrap-text
+      row-numbers-enabled: true
+    isLive: false
+
+  # ========================================
+  # SECTION: INSTALLATION ANALYSIS
+  # ========================================
+  
+  widget-installation-vs-usage:
+    x: 0
+    y: 0
+    height: 6
+    width: 12
+    type: query
+    title: "Installation vs. Active Usage Comparison"
+    queryString: |
+      // Find all hosts with TeamViewer installed
+      #event_simpleName=ProcessRollup2 
+      | FileName=/(teamviewer|tv_w32|tv_x64)\.exe/i
+      | ComputerName=~wildcard(?ComputerName, ignoreCase=true)
+      | UserName=~wildcard(?UserName, ignoreCase=true)
+      | groupBy([aid, ComputerName], function=([
+          collect([FileName, ImageFileName, UserName], limit=1),
+          min(@timestamp, as=lastSeen)
+        ]), limit=max)
+      | installation:="Installed"
+      
+      // Check for network activity
+      | join({
+          #event_simpleName=NetworkConnectIP4
+          | join({
+              #event_simpleName=ProcessRollup2 
+              | FileName=/(teamviewer|tv_w32|tv_x64)\.exe/i
+            }, key=TargetProcessId, field=ContextProcessId, include=[FileName])
+          | FileName=*
+          | groupBy([aid], function=[
+              count(aid, as=activeConnections),
+              max(@timestamp, as=lastActivity)
+            ])
+          | activeUsage:="Active"
+        }, field=aid, include=[activeUsage, activeConnections, lastActivity], mode=left)
+      
+      // Categorize usage status
+      | case {
+          activeUsage="Active" | status:="✓ Actively Used";
+          installation="Installed" | status:="⚠ Installed Only (No Recent Activity)";
+          * | status:="❌ Unknown";
+      }
+      
+      // Default values
+      | default(value="Not Active", field=[activeUsage], replaceEmpty=true)
+      | default(value=0, field=[activeConnections], replaceEmpty=true)
+      | default(value="N/A", field=[lastActivity], replaceEmpty=true)
+      
+      // Format timestamps
+      | lastSeen:=formatTime(field=lastSeen, format="%Y-%m-%d %H:%M:%S")
+      | case {
+          lastActivity!="N/A" | lastActivity:=formatTime(field=lastActivity, format="%Y-%m-%d %H:%M:%S");
+          * | lastActivity:="No Network Activity";
+      }
+      
+      // Add RTR link
+      | RTR:=format("[RTR Console](https://falcon.crowdstrike.com/activity/real-time-response/console/?aid=%s)", field=[aid])
+      
+      // Sort by status to prioritize active systems
+      | sort([status, activeConnections], order=[asc, desc])
+      
+      // Table output
+      | table([aid, ComputerName, UserName, FileName, status, activeConnections, lastSeen, lastActivity, RTR])
+    visualization: table-view
+    options:
+      cell-overflow: wrap-text
+      row-numbers-enabled: true
+      configured-columns:
+        status:
+          color:
+            conditions:
+              - color: '#29a34bff'
+                condition:
+                  arg: '✓ Actively Used'
+                  type: Equal
+              - color: '#f59464ff'
+                condition:
+                  arg: '⚠ Installed Only (No Recent Activity)'
+                  type: Equal
+            defaultColor: '#C93637'
+        activeConnections:
+          color:
+            conditions:
+              - color: '#C93637'
+                condition:
+                  arg: 0
+                  type: Equal
+              - color: '#29a34bff'
+                condition:
+                  arg: 0
+                  type: GreaterThan
+            defaultColor: '#126CC6FF'
+    isLive: false
+  
+  widget-inactive-installations:
+    x: 0
+    y: 6
+    height: 4
+    width: 12
+    type: query
+    title: "Cleanup Candidates - TeamViewer Installed But Not Used (7d)"
+    queryString: |
+      // Find hosts with TeamViewer but no network activity
+      #event_simpleName=ProcessRollup2 
+      | FileName=/(teamviewer|tv_w32|tv_x64)\.exe/i
+      | ComputerName=~wildcard(?ComputerName, ignoreCase=true)
+      | groupBy([aid, ComputerName], function=([
+          collect([FileName, ImageFileName, UserName], limit=1),
+          count(aid, as=executionCount),
+          min(@timestamp, as=firstSeen),
+          max(@timestamp, as=lastSeen)
+        ]), limit=max)
+      
+      // Left join to check for network activity
+      | join({
+          #event_simpleName=NetworkConnectIP4
+          | join({
+              #event_simpleName=ProcessRollup2 
+              | FileName=/(teamviewer|tv_w32|tv_x64)\.exe/i
+            }, key=TargetProcessId, field=ContextProcessId, include=[FileName])
+          | FileName=*
+          | groupBy([aid], function=count(aid, as=activeConnections))
+          | hasNetwork:="Yes"
+        }, field=aid, include=[hasNetwork, activeConnections], mode=left)
+      
+      // Filter to only show hosts WITHOUT network activity
+      | !hasNetwork="Yes"
+      
+      // Format timestamps
+      | firstSeen:=formatTime(field=firstSeen, format="%Y-%m-%d %H:%M:%S")
+      | lastSeen:=formatTime(field=lastSeen, format="%Y-%m-%d %H:%M:%S")
+      
+      // Add recommendation
+      | recommendation:="✓ Safe to Remove"
+      
+      // Add RTR link
+      | RTR:=format("[RTR Console](https://falcon.crowdstrike.com/activity/real-time-response/console/?aid=%s)", field=[aid])
+      
+      // Sort by execution count
+      | sort(executionCount, order=desc)
+      
+      // Table output
+      | table([ComputerName, UserName, FileName, executionCount, lastSeen, recommendation, RTR])
+    visualization: table-view
+    options:
+      cell-overflow: wrap-text
+      row-numbers-enabled: true
+    isLive: false
+
+  # ========================================
+  # SECTION: WEEKLY REPORT
+  # ========================================
+  
+  widget-daily-usage-summary:
+    x: 0
+    y: 0
+    height: 5
+    width: 8
+    type: query
+    title: "Daily Usage Summary (Last 7 Days)"
+    queryString: |
+      #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/ event_platform=Win
+      | FileName=/(teamviewer|tv_w32|tv_x64)\.exe/i
+      | ComputerName=~wildcard(?ComputerName, ignoreCase=true)
+      | UserName=~wildcard(?UserName, ignoreCase=true)
+      | falconPID:=TargetProcessId | falconPID:=ContextProcessId
+      | day:=formatTime("%Y-%m-%d", field=@timestamp)
+      | selfJoinFilter(field=[aid, falconPID], where=[
+          {#event_simpleName=ProcessRollup2},
+          {#event_simpleName=NetworkConnectIP4}
+        ])
+      | groupBy([day], function=([
+          count(aid, distinct=true, as=activeHosts),
+          count(UserName, distinct=true, as=activeUsers),
+          count(RemoteAddressIP4, distinct=true, as=uniqueConnections)
+        ]), limit=max)
+      | usageScore:=activeHosts * uniqueConnections
+      | sort(day, order=desc)
+      | table([day, activeHosts, activeUsers, uniqueConnections, usageScore])
+    visualization: table-view
+    options:
+      cell-overflow: wrap-text
+      row-numbers-enabled: true
+      configured-columns:
+        usageScore:
+          color:
+            conditions:
+              - color: '#C93637'
+                condition:
+                  arg: 100
+                  type: GreaterThan
+              - color: '#f59464ff'
+                condition:
+                  arg: 50
+                  type: GreaterThan
+            defaultColor: '#29a34bff'
+    isLive: false
+  
+  widget-user-activity-heatmap:
+    x: 8
+    y: 0
+    height: 5
+    width: 4
+    type: query
+    title: "User Activity Distribution"
+    queryString: |
+      #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/ event_platform=Win
+      | FileName=/(teamviewer|tv_w32|tv_x64)\.exe/i
+      | UserName=~wildcard(?UserName, ignoreCase=true)
+      | falconPID:=TargetProcessId | falconPID:=ContextProcessId
+      | selfJoinFilter(field=[aid, falconPID], where=[
+          {#event_simpleName=ProcessRollup2},
+          {#event_simpleName=NetworkConnectIP4}
+        ])
+      | groupBy([UserName], function=count(aid, as=activityCount), limit=20)
+      | sort(activityCount, order=desc)
+    visualization: bar-chart
+    options:
+      legendPosition: none
+    isLive: false
+
+  # ========================================
+  # SECTION: INVESTIGATION TOOLS
+  # ========================================
+  
+  widget-process-prevalence:
+    x: 0
+    y: 0
+    height: 5
+    width: 6
+    type: query
+    title: "TeamViewer Process Prevalence Analysis"
+    queryString: |
+      #event_simpleName=ProcessRollup2 event_platform=Win
+      | FileName=/(teamviewer|tv_w32|tv_x64)\.exe/i
+      | ComputerName=~wildcard(?ComputerName, ignoreCase=true)
+      | FilePath=/\\Device\\HarddiskVolume\d\\(?<ShortFilePath>.+$)/
+      | groupBy([FileName, ShortFilePath, SHA256HashData], function=([
+          count(aid, as=totalExecutions),
+          count(aid, distinct=true, as=uniqueEndpoints),
+          collect([ComputerName], limit=10)
+        ]), limit=max)
+      | sort(uniqueEndpoints, order=desc)
+      | table([FileName, ShortFilePath, SHA256HashData, totalExecutions, uniqueEndpoints, ComputerName])
+    visualization: table-view
+    options:
+      cell-overflow: wrap-text
+      row-numbers-enabled: true
+    isLive: false
+  
+  widget-outreach-list:
+    x: 6
+    y: 0
+    height: 5
+    width: 6
+    type: query
+    title: "📧 User Outreach List - Export for Migration Communication"
+    queryString: |
+      #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/ event_platform=Win
+      | FileName=/(teamviewer|tv_w32|tv_x64)\.exe/i
+      | ComputerName=~wildcard(?ComputerName, ignoreCase=true)
+      | UserName=~wildcard(?UserName, ignoreCase=true)
+      | falconPID:=TargetProcessId | falconPID:=ContextProcessId
+      | selfJoinFilter(field=[aid, falconPID], where=[
+          {#event_simpleName=ProcessRollup2}, 
+          {#event_simpleName=NetworkConnectIP4}
+        ])
+      | groupBy([UserName, ComputerName], function=([
+          count(aid, as=sessionCount),
+          max(@timestamp, as=lastActivity),
+          count(aid, distinct=true, as=uniqueHosts)
+        ]), limit=max)
+      | lastActivity:=formatTime(field=lastActivity, format="%Y-%m-%d")
+      | urgency:=case {
+          sessionCount > 50 | "🔴 High - Frequent User";
+          sessionCount > 20 | "🟡 Medium - Regular User";
+          * | "🟢 Low - Occasional User";
+      }
+      | sort([urgency, sessionCount], order=[asc, desc])
+      | table([UserName, ComputerName, sessionCount, lastActivity, urgency])
+    visualization: table-view
+    options:
+      cell-overflow: wrap-text
+      row-numbers-enabled: true
+      configured-columns:
+        urgency:
+          color:
+            conditions:
+              - color: '#C93637'
+                condition:
+                  arg: '🔴 High - Frequent User'
+                  type: Equal
+              - color: '#f59464ff'
+                condition:
+                  arg: '🟡 Medium - Regular User'
+                  type: Equal
+              - color: '#29a34bff'
+                condition:
+                  arg: '🟢 Low - Occasional User'
+                  type: Equal
+            defaultColor: '#126CC6FF'
+    isLive: false
