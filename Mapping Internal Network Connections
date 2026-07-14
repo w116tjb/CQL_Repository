@@ -1,0 +1,1153 @@
+# Internal Network Connection Graph (CrowdStrike NGSIEM Dashboard)
+
+Maps process-to-process connections between internal hosts by stitching `NetworkConnectIP4/6` events from initiating endpoints to the matching `NetworkReceiveAcceptIP4/6` events on receiving endpoints, correlating on the mirrored 4-tuple (local/remote IP and port). Useful for lateral-movement hunting, service-dependency mapping, and finding gaps in sensor coverage.
+
+Includes KPI tiles, a connections-over-time chart, a source→destination host Sankey, top-N breakdowns (ports, source processes, destination processes), a full connection-detail table with Process Explorer deep-links, and a dedicated widget surfacing connections to unsensored internal hosts. Filterable by source/destination host, process, and user, plus destination port, with matching exclusion boxes.
+
+## Limitations
+
+- **Both endpoints must have a Falcon sensor.** Most widgets use an inner join, so a connection only appears if both the initiator and the receiver reported events. Connections to unmanaged hosts (network appliances, IoT, hypervisors, unsensored servers) won't stitch — the "Connections to Unsensored Internal Hosts" widget exists specifically to surface these, but every other widget is blind to them.
+- **Fixed 1-hour accept-side lookup window.** The join subquery uses `start=1h` independent of the dashboard time selector. If you widen the dashboard beyond one hour, connections may fail to stitch unless you edit each widget's `start=1h` inside the `join(...)` call to match.
+- **20,000-tuple ceiling per widget.** The accept-side aggregation caps at 20,000 unique 4-tuples (`limit=max` sets a ceiling; it does not remove one). In very busy environments, some connections may silently be dropped from the results.
+- **Single-value filters only.** Each filter box takes one value. Inclusion boxes support wildcards (`*`, `prod-*`, `*sql*`); exclusion boxes are exact-match only. Multi-select is not supported — it's incompatible with the join-based query structure this dashboard depends on.
+- **Filters on the unsensored-hosts widget are source-side only.** Destination host/process/user filters don't apply there, since unsensored destinations have no such fields.
+- **High event volume.** Network telemetry is heavy. Keep the time range short and apply filters before running wide.
+- **Scope.** Covers internal↔internal traffic only (RFC1918 + IPv6 ULA `fd00::/8`, loopback excluded). Traffic to external IPs is out of scope by design.
+- **Region-specific links.** Process Explorer deep-links are hardcoded to the US-1 console (`falcon.crowdstrike.com`); adjust for other cloud regions.
+
+$schema: https://schemas.humio.com/dashboard/v0.23.0
+name: Internal Network Connection Graph
+updateFrequency: never
+timeSelector: {}
+sharedTimeInterval:
+  enabled: true
+  isLive: false
+  start: 1h
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+# Wildcard text parameters use `type: text`. If your tenant's Humio/LogScale
+# build doesn't accept `text`, swap to `type: list` with a small `values:` set.
+# All wildcard fields default to "*" (match everything).
+# ==============================================================================
+parameters:
+  cid_input:
+    label: CID
+    type: query
+    query: |-
+      #data_source_name=cid_name #repo=sensor_metadata #type=metadata-parser
+      | cid=* name=*
+      | top([cid, name], limit=100)
+      | cidname_cid := format("%s -> %s", field=[name, cid])
+      | sort(name, order=asc, limit=1000)
+    timeInterval: 1d
+    useDashboardTimeIfSet: true
+    defaultValue: '*'
+    valueField: cid
+    labelField: cidname_cid
+    order: 0
+    width: 2
+
+  SourceHost:
+    label: Source Host
+    type: text
+    defaultValue: '*'
+    order: 1
+    width: 1
+
+  DestHost:
+    label: Destination Host
+    type: text
+    defaultValue: '*'
+    order: 2
+    width: 1
+
+  SourceProcess:
+    label: Source Process
+    type: text
+    defaultValue: '*'
+    order: 3
+    width: 1
+
+  DestProcess:
+    label: Destination Process
+    type: text
+    defaultValue: '*'
+    order: 4
+    width: 1
+
+  SourceUser:
+    label: Source User
+    type: text
+    defaultValue: '*'
+    order: 5
+    width: 1
+
+  DestUser:
+    label: Destination User
+    type: text
+    defaultValue: '*'
+    order: 6
+    width: 1
+
+  DestPort:
+    label: Destination Port
+    type: text
+    defaultValue: '*'
+    order: 7
+    width: 1
+
+  ExcludeSourceHost:
+    label: Exclude Source Host
+    type: text
+    defaultValue: ''
+    order: 8
+    width: 1
+
+  ExcludeDestHost:
+    label: Exclude Destination Host
+    type: text
+    defaultValue: ''
+    order: 9
+    width: 1
+
+  ExcludeSourceIP:
+    label: Exclude Source IP
+    type: text
+    defaultValue: ''
+    order: 10
+    width: 1
+
+  ExcludeDestIP:
+    label: Exclude Destination IP
+    type: text
+    defaultValue: ''
+    order: 11
+    width: 1
+
+  ExcludeSourceProcess:
+    label: Exclude Source Process
+    type: text
+    defaultValue: ''
+    order: 12
+    width: 1
+
+  ExcludeDestProcess:
+    label: Exclude Destination Process
+    type: text
+    defaultValue: ''
+    order: 13
+    width: 1
+
+  ExcludeSourceUser:
+    label: Exclude Source User
+    type: text
+    defaultValue: ''
+    order: 14
+    width: 1
+
+  ExcludeDestUser:
+    label: Exclude Destination User
+    type: text
+    defaultValue: ''
+    order: 15
+    width: 1
+
+  ExcludeDestPort:
+    label: Exclude Destination Port
+    type: text
+    defaultValue: ''
+    order: 16
+    width: 1
+
+
+# ==============================================================================
+# SECTIONS
+# ==============================================================================
+sections:
+  section-graph:
+    collapsed: false
+    timeSelector:
+      end: now
+      start: 1h
+    widgetIds:
+      - note-header
+      - param-panel
+      - kpi-total-connections
+      - kpi-unique-source-hosts
+      - kpi-unique-dest-hosts
+      - kpi-unique-edges
+      - chart-connections-time
+      - sankey-host-flow
+      - bar-top-dest-ports
+      - bar-top-source-processes
+      - bar-top-dest-processes
+      - table-connection-details
+      - table-unsensored-targets
+    order: 1
+    title: Internal Connection Graph
+
+
+# ==============================================================================
+# WIDGETS
+# ==============================================================================
+widgets:
+
+  # ------------------------------------------------------------------ HEADER
+  note-header:
+    type: note
+    x: 0
+    y: 0
+    width: 12
+    height: 3
+    title: ''
+    text: "# Internal Network Connection Graph\n\nStitches `NetworkConnectIP4/6` events from initiating endpoints with `NetworkReceiveAcceptIP4/6` events on receiving endpoints to map **process-to-process connections** across your internal network using Falcon's threat graph.\n\n**Inclusion filters** (top boxes): text boxes with wildcard support. `*` = include all (default), `dc01` = exact, `prod-*` = prefix, `*sql*` = substring, `*.corp.local` = suffix. Case-insensitive on text fields. Single value per box.\n\n**Exclusion filters** (`Exclude *` boxes): single value, **exact match** (no wildcards). Default empty = exclude nothing. Exclusions stack with AND semantics.\n\n**Coverage:** Most widgets use an inner join — connections only appear if Falcon has a sensor on **both** endpoints. The bottom widget surfaces connections where the destination is **not** sensored (coverage gaps). Internal subnets: RFC1918 (10/8, 172.16/12, 192.168/16) + IPv6 ULA (fd00::/8). Loopback excluded.\n\n**Known limits:** (1) The accept-side lookup caps at 20,000 unique 4-tuples per widget run — in very busy environments some connections may not stitch; narrow the time range or filters if counts look low. (2) The accept-side lookup window is fixed at 1h independent of the dashboard time range — if you widen the dashboard beyond 1h, edit each widget's `start=1h` inside `join(...)` to match.\n\n**Performance:** Network events are high-volume. Keep the time range short and apply filters before running wide."
+
+  # ------------------------------------------------------------ PARAM PANEL
+  param-panel:
+    type: parameterPanel
+    x: 0
+    y: 3
+    width: 12
+    height: 2
+    title: Filters
+    parameterIds:
+      - cid_input
+      - SourceHost
+      - ExcludeSourceHost
+      - DestHost
+      - ExcludeDestHost
+      - ExcludeSourceIP
+      - ExcludeDestIP
+      - SourceProcess
+      - ExcludeSourceProcess
+      - DestProcess
+      - ExcludeDestProcess
+      - SourceUser
+      - ExcludeSourceUser
+      - DestUser
+      - ExcludeDestUser
+      - DestPort
+      - ExcludeDestPort
+
+  # ---------------------------------------------------------- KPI: TOTAL
+  kpi-total-connections:
+    type: query
+    x: 0
+    y: 5
+    width: 3
+    height: 3
+    title: Total Connections
+    queryString: |-
+      (#event_simpleName=NetworkConnectIP4 OR #event_simpleName=NetworkConnectIP6)
+      | in(field=#repo.cid, values=[?cid_input])
+      | cidr(LocalIP,  subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+      | cidr(RemoteIP, subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+      | !cidr(RemoteIP, subnet=["127.0.0.0/8","::1/128"])
+      | test(LocalIP != RemoteIP)
+      // Source-side INCLUSION filters (wildcards: '*' = all, '*sql*' = substring, 'prod-*' = prefix)
+      | ComputerName        =~ wildcard(?{SourceHost="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+      | ContextBaseFileName =~ wildcard(?{SourceProcess="*"}, ignoreCase=true, includeEverythingOnAsterisk=true)
+      | UserName            =~ wildcard(?{SourceUser="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+      | RemotePort          =~ wildcard(?{DestPort="*"},      ignoreCase=true, includeEverythingOnAsterisk=true)
+      // Source-side EXCLUSION filters (single-value, exact match; default '' = exclude nothing)
+      | __xSH  := ?{ExcludeSourceHost=""}
+      | __xSI  := ?{ExcludeSourceIP=""}
+      | __xSP  := ?{ExcludeSourceProcess=""}
+      | __xSU  := ?{ExcludeSourceUser=""}
+      | __xDI  := ?{ExcludeDestIP=""}
+      | __xDPo := ?{ExcludeDestPort=""}
+      | case { __xSH  = "" ; * | test(ComputerName        != __xSH ) ; }
+      | case { __xSI  = "" ; * | test(LocalIP             != __xSI ) ; }
+      | case { __xSP  = "" ; * | test(ContextBaseFileName != __xSP ) ; }
+      | case { __xSU  = "" ; * | test(UserName            != __xSU ) ; }
+      | case { __xDI  = "" ; * | test(RemoteIP            != __xDI ) ; }
+      | case { __xDPo = "" ; * | test(format("%s", field=[RemotePort]) != __xDPo) ; }
+      | drop([__xSH, __xSI, __xSP, __xSU, __xDI, __xDPo])
+      | join(
+          query={
+              (#event_simpleName=NetworkReceiveAcceptIP4 OR #event_simpleName=NetworkReceiveAcceptIP6)
+              | in(field=#repo.cid, values=[?cid_input])
+              | cidr(LocalIP,  subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+              | cidr(RemoteIP, subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+              // Dest-side INCLUSION filters
+              | ComputerName        =~ wildcard(?{DestHost="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+              | ContextBaseFileName =~ wildcard(?{DestProcess="*"}, ignoreCase=true, includeEverythingOnAsterisk=true)
+              | UserName            =~ wildcard(?{DestUser="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+              // Dest-side EXCLUSION filters
+              | __xDH  := ?{ExcludeDestHost=""}
+              | __xDPr := ?{ExcludeDestProcess=""}
+              | __xDU  := ?{ExcludeDestUser=""}
+              | case { __xDH  = "" ; * | test(ComputerName        != __xDH ) ; }
+              | case { __xDPr = "" ; * | test(ContextBaseFileName != __xDPr) ; }
+              | case { __xDU  = "" ; * | test(UserName            != __xDU ) ; }
+              | drop([__xDH, __xDPr, __xDU])
+              | rename([[aid, DestAid], [ComputerName, DestHost], [UserName, DestUser],
+                        [LocalIP, DestLocalIP], [LocalPort, DestLocalPort],
+                        [RemoteIP, DestRemoteIP], [RemotePort, DestRemotePort],
+                        [ContextBaseFileName, DestProcess], [ContextProcessId, DestProcessId]])
+              | groupBy([DestRemoteIP, DestRemotePort, DestLocalIP, DestLocalPort],
+                        function=selectLast([DestAid, DestHost, DestUser, DestProcess, DestProcessId]),
+                        limit=max)
+          },
+          field=[LocalIP, LocalPort, RemoteIP, RemotePort],
+          key=[DestRemoteIP, DestRemotePort, DestLocalIP, DestLocalPort],
+          include=[DestAid, DestHost, DestUser, DestProcess, DestProcessId],
+          mode=inner,
+          start=1h)
+      | count(as=TotalConnections)
+    end: now
+    start: 1h
+    visualization: single-value
+    options:
+      default: {}
+      use-colorised-thresholds: false
+    isLive: false
+
+  # ---------------------------------------------- KPI: UNIQUE SOURCE HOSTS
+  kpi-unique-source-hosts:
+    type: query
+    x: 3
+    y: 5
+    width: 3
+    height: 3
+    title: Unique Source Hosts
+    queryString: |-
+      (#event_simpleName=NetworkConnectIP4 OR #event_simpleName=NetworkConnectIP6)
+      | in(field=#repo.cid, values=[?cid_input])
+      | cidr(LocalIP,  subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+      | cidr(RemoteIP, subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+      | !cidr(RemoteIP, subnet=["127.0.0.0/8","::1/128"])
+      | test(LocalIP != RemoteIP)
+      // Source-side INCLUSION filters (wildcards: '*' = all, '*sql*' = substring, 'prod-*' = prefix)
+      | ComputerName        =~ wildcard(?{SourceHost="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+      | ContextBaseFileName =~ wildcard(?{SourceProcess="*"}, ignoreCase=true, includeEverythingOnAsterisk=true)
+      | UserName            =~ wildcard(?{SourceUser="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+      | RemotePort          =~ wildcard(?{DestPort="*"},      ignoreCase=true, includeEverythingOnAsterisk=true)
+      // Source-side EXCLUSION filters (single-value, exact match; default '' = exclude nothing)
+      | __xSH  := ?{ExcludeSourceHost=""}
+      | __xSI  := ?{ExcludeSourceIP=""}
+      | __xSP  := ?{ExcludeSourceProcess=""}
+      | __xSU  := ?{ExcludeSourceUser=""}
+      | __xDI  := ?{ExcludeDestIP=""}
+      | __xDPo := ?{ExcludeDestPort=""}
+      | case { __xSH  = "" ; * | test(ComputerName        != __xSH ) ; }
+      | case { __xSI  = "" ; * | test(LocalIP             != __xSI ) ; }
+      | case { __xSP  = "" ; * | test(ContextBaseFileName != __xSP ) ; }
+      | case { __xSU  = "" ; * | test(UserName            != __xSU ) ; }
+      | case { __xDI  = "" ; * | test(RemoteIP            != __xDI ) ; }
+      | case { __xDPo = "" ; * | test(format("%s", field=[RemotePort]) != __xDPo) ; }
+      | drop([__xSH, __xSI, __xSP, __xSU, __xDI, __xDPo])
+      | SourceHost := ComputerName
+      | join(
+          query={
+              (#event_simpleName=NetworkReceiveAcceptIP4 OR #event_simpleName=NetworkReceiveAcceptIP6)
+              | in(field=#repo.cid, values=[?cid_input])
+              | cidr(LocalIP,  subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+              | cidr(RemoteIP, subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+              // Dest-side INCLUSION filters
+              | ComputerName        =~ wildcard(?{DestHost="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+              | ContextBaseFileName =~ wildcard(?{DestProcess="*"}, ignoreCase=true, includeEverythingOnAsterisk=true)
+              | UserName            =~ wildcard(?{DestUser="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+              // Dest-side EXCLUSION filters
+              | __xDH  := ?{ExcludeDestHost=""}
+              | __xDPr := ?{ExcludeDestProcess=""}
+              | __xDU  := ?{ExcludeDestUser=""}
+              | case { __xDH  = "" ; * | test(ComputerName        != __xDH ) ; }
+              | case { __xDPr = "" ; * | test(ContextBaseFileName != __xDPr) ; }
+              | case { __xDU  = "" ; * | test(UserName            != __xDU ) ; }
+              | drop([__xDH, __xDPr, __xDU])
+              | rename([[aid, DestAid], [ComputerName, DestHost],
+                        [LocalIP, DestLocalIP], [LocalPort, DestLocalPort],
+                        [RemoteIP, DestRemoteIP], [RemotePort, DestRemotePort]])
+              | groupBy([DestRemoteIP, DestRemotePort, DestLocalIP, DestLocalPort],
+                        function=selectLast([DestAid, DestHost]), limit=max)
+          },
+          field=[LocalIP, LocalPort, RemoteIP, RemotePort],
+          key=[DestRemoteIP, DestRemotePort, DestLocalIP, DestLocalPort],
+          include=[DestAid, DestHost],
+          mode=inner, start=1h)
+      | count(SourceHost, distinct=true, as=UniqueSourceHosts)
+    end: now
+    start: 1h
+    visualization: single-value
+    options:
+      default: {}
+      use-colorised-thresholds: false
+    isLive: false
+
+  # ------------------------------------------------ KPI: UNIQUE DEST HOSTS
+  kpi-unique-dest-hosts:
+    type: query
+    x: 6
+    y: 5
+    width: 3
+    height: 3
+    title: Unique Destination Hosts
+    queryString: |-
+      (#event_simpleName=NetworkConnectIP4 OR #event_simpleName=NetworkConnectIP6)
+      | in(field=#repo.cid, values=[?cid_input])
+      | cidr(LocalIP,  subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+      | cidr(RemoteIP, subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+      | !cidr(RemoteIP, subnet=["127.0.0.0/8","::1/128"])
+      | test(LocalIP != RemoteIP)
+      // Source-side INCLUSION filters (wildcards: '*' = all, '*sql*' = substring, 'prod-*' = prefix)
+      | ComputerName        =~ wildcard(?{SourceHost="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+      | ContextBaseFileName =~ wildcard(?{SourceProcess="*"}, ignoreCase=true, includeEverythingOnAsterisk=true)
+      | UserName            =~ wildcard(?{SourceUser="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+      | RemotePort          =~ wildcard(?{DestPort="*"},      ignoreCase=true, includeEverythingOnAsterisk=true)
+      // Source-side EXCLUSION filters (single-value, exact match; default '' = exclude nothing)
+      | __xSH  := ?{ExcludeSourceHost=""}
+      | __xSI  := ?{ExcludeSourceIP=""}
+      | __xSP  := ?{ExcludeSourceProcess=""}
+      | __xSU  := ?{ExcludeSourceUser=""}
+      | __xDI  := ?{ExcludeDestIP=""}
+      | __xDPo := ?{ExcludeDestPort=""}
+      | case { __xSH  = "" ; * | test(ComputerName        != __xSH ) ; }
+      | case { __xSI  = "" ; * | test(LocalIP             != __xSI ) ; }
+      | case { __xSP  = "" ; * | test(ContextBaseFileName != __xSP ) ; }
+      | case { __xSU  = "" ; * | test(UserName            != __xSU ) ; }
+      | case { __xDI  = "" ; * | test(RemoteIP            != __xDI ) ; }
+      | case { __xDPo = "" ; * | test(format("%s", field=[RemotePort]) != __xDPo) ; }
+      | drop([__xSH, __xSI, __xSP, __xSU, __xDI, __xDPo])
+      | join(
+          query={
+              (#event_simpleName=NetworkReceiveAcceptIP4 OR #event_simpleName=NetworkReceiveAcceptIP6)
+              | in(field=#repo.cid, values=[?cid_input])
+              | cidr(LocalIP,  subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+              | cidr(RemoteIP, subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+              // Dest-side INCLUSION filters
+              | ComputerName        =~ wildcard(?{DestHost="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+              | ContextBaseFileName =~ wildcard(?{DestProcess="*"}, ignoreCase=true, includeEverythingOnAsterisk=true)
+              | UserName            =~ wildcard(?{DestUser="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+              // Dest-side EXCLUSION filters
+              | __xDH  := ?{ExcludeDestHost=""}
+              | __xDPr := ?{ExcludeDestProcess=""}
+              | __xDU  := ?{ExcludeDestUser=""}
+              | case { __xDH  = "" ; * | test(ComputerName        != __xDH ) ; }
+              | case { __xDPr = "" ; * | test(ContextBaseFileName != __xDPr) ; }
+              | case { __xDU  = "" ; * | test(UserName            != __xDU ) ; }
+              | drop([__xDH, __xDPr, __xDU])
+              | rename([[aid, DestAid], [ComputerName, DestHost],
+                        [LocalIP, DestLocalIP], [LocalPort, DestLocalPort],
+                        [RemoteIP, DestRemoteIP], [RemotePort, DestRemotePort]])
+              | groupBy([DestRemoteIP, DestRemotePort, DestLocalIP, DestLocalPort],
+                        function=selectLast([DestAid, DestHost]), limit=max)
+          },
+          field=[LocalIP, LocalPort, RemoteIP, RemotePort],
+          key=[DestRemoteIP, DestRemotePort, DestLocalIP, DestLocalPort],
+          include=[DestAid, DestHost],
+          mode=inner, start=1h)
+      | count(DestHost, distinct=true, as=UniqueDestHosts)
+    end: now
+    start: 1h
+    visualization: single-value
+    options:
+      default: {}
+      use-colorised-thresholds: false
+    isLive: false
+
+  # --------------------------------------------------- KPI: UNIQUE EDGES
+  kpi-unique-edges:
+    type: query
+    x: 9
+    y: 5
+    width: 3
+    height: 3
+    title: Unique Connection Edges
+    queryString: |-
+      (#event_simpleName=NetworkConnectIP4 OR #event_simpleName=NetworkConnectIP6)
+      | in(field=#repo.cid, values=[?cid_input])
+      | cidr(LocalIP,  subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+      | cidr(RemoteIP, subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+      | !cidr(RemoteIP, subnet=["127.0.0.0/8","::1/128"])
+      | test(LocalIP != RemoteIP)
+      // Source-side INCLUSION filters (wildcards: '*' = all, '*sql*' = substring, 'prod-*' = prefix)
+      | ComputerName        =~ wildcard(?{SourceHost="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+      | ContextBaseFileName =~ wildcard(?{SourceProcess="*"}, ignoreCase=true, includeEverythingOnAsterisk=true)
+      | UserName            =~ wildcard(?{SourceUser="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+      | RemotePort          =~ wildcard(?{DestPort="*"},      ignoreCase=true, includeEverythingOnAsterisk=true)
+      // Source-side EXCLUSION filters (single-value, exact match; default '' = exclude nothing)
+      | __xSH  := ?{ExcludeSourceHost=""}
+      | __xSI  := ?{ExcludeSourceIP=""}
+      | __xSP  := ?{ExcludeSourceProcess=""}
+      | __xSU  := ?{ExcludeSourceUser=""}
+      | __xDI  := ?{ExcludeDestIP=""}
+      | __xDPo := ?{ExcludeDestPort=""}
+      | case { __xSH  = "" ; * | test(ComputerName        != __xSH ) ; }
+      | case { __xSI  = "" ; * | test(LocalIP             != __xSI ) ; }
+      | case { __xSP  = "" ; * | test(ContextBaseFileName != __xSP ) ; }
+      | case { __xSU  = "" ; * | test(UserName            != __xSU ) ; }
+      | case { __xDI  = "" ; * | test(RemoteIP            != __xDI ) ; }
+      | case { __xDPo = "" ; * | test(format("%s", field=[RemotePort]) != __xDPo) ; }
+      | drop([__xSH, __xSI, __xSP, __xSU, __xDI, __xDPo])
+      | SourceHost    := ComputerName
+      | SourceProcess := ContextBaseFileName
+      | join(
+          query={
+              (#event_simpleName=NetworkReceiveAcceptIP4 OR #event_simpleName=NetworkReceiveAcceptIP6)
+              | in(field=#repo.cid, values=[?cid_input])
+              | cidr(LocalIP,  subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+              | cidr(RemoteIP, subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+              // Dest-side INCLUSION filters
+              | ComputerName        =~ wildcard(?{DestHost="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+              | ContextBaseFileName =~ wildcard(?{DestProcess="*"}, ignoreCase=true, includeEverythingOnAsterisk=true)
+              | UserName            =~ wildcard(?{DestUser="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+              // Dest-side EXCLUSION filters
+              | __xDH  := ?{ExcludeDestHost=""}
+              | __xDPr := ?{ExcludeDestProcess=""}
+              | __xDU  := ?{ExcludeDestUser=""}
+              | case { __xDH  = "" ; * | test(ComputerName        != __xDH ) ; }
+              | case { __xDPr = "" ; * | test(ContextBaseFileName != __xDPr) ; }
+              | case { __xDU  = "" ; * | test(UserName            != __xDU ) ; }
+              | drop([__xDH, __xDPr, __xDU])
+              | rename([[aid, DestAid], [ComputerName, DestHost],
+                        [LocalIP, DestLocalIP], [LocalPort, DestLocalPort],
+                        [RemoteIP, DestRemoteIP], [RemotePort, DestRemotePort],
+                        [ContextBaseFileName, DestProcess]])
+              | groupBy([DestRemoteIP, DestRemotePort, DestLocalIP, DestLocalPort],
+                        function=selectLast([DestAid, DestHost, DestProcess]), limit=max)
+          },
+          field=[LocalIP, LocalPort, RemoteIP, RemotePort],
+          key=[DestRemoteIP, DestRemotePort, DestLocalIP, DestLocalPort],
+          include=[DestAid, DestHost, DestProcess],
+          mode=inner, start=1h)
+      | Edge := format(format="%s/%s -> %s/%s", field=[SourceHost, SourceProcess, DestHost, DestProcess])
+      | count(Edge, distinct=true, as=UniqueEdges)
+    end: now
+    start: 1h
+    visualization: single-value
+    options:
+      default: {}
+      use-colorised-thresholds: false
+    isLive: false
+
+  # ----------------------------------------------- TIME CHART: connections
+  chart-connections-time:
+    type: query
+    x: 0
+    y: 8
+    width: 12
+    height: 4
+    title: Connections Over Time
+    queryString: |-
+      (#event_simpleName=NetworkConnectIP4 OR #event_simpleName=NetworkConnectIP6)
+      | in(field=#repo.cid, values=[?cid_input])
+      | cidr(LocalIP,  subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+      | cidr(RemoteIP, subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+      | !cidr(RemoteIP, subnet=["127.0.0.0/8","::1/128"])
+      | test(LocalIP != RemoteIP)
+      // Source-side INCLUSION filters (wildcards: '*' = all, '*sql*' = substring, 'prod-*' = prefix)
+      | ComputerName        =~ wildcard(?{SourceHost="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+      | ContextBaseFileName =~ wildcard(?{SourceProcess="*"}, ignoreCase=true, includeEverythingOnAsterisk=true)
+      | UserName            =~ wildcard(?{SourceUser="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+      | RemotePort          =~ wildcard(?{DestPort="*"},      ignoreCase=true, includeEverythingOnAsterisk=true)
+      // Source-side EXCLUSION filters (single-value, exact match; default '' = exclude nothing)
+      | __xSH  := ?{ExcludeSourceHost=""}
+      | __xSI  := ?{ExcludeSourceIP=""}
+      | __xSP  := ?{ExcludeSourceProcess=""}
+      | __xSU  := ?{ExcludeSourceUser=""}
+      | __xDI  := ?{ExcludeDestIP=""}
+      | __xDPo := ?{ExcludeDestPort=""}
+      | case { __xSH  = "" ; * | test(ComputerName        != __xSH ) ; }
+      | case { __xSI  = "" ; * | test(LocalIP             != __xSI ) ; }
+      | case { __xSP  = "" ; * | test(ContextBaseFileName != __xSP ) ; }
+      | case { __xSU  = "" ; * | test(UserName            != __xSU ) ; }
+      | case { __xDI  = "" ; * | test(RemoteIP            != __xDI ) ; }
+      | case { __xDPo = "" ; * | test(format("%s", field=[RemotePort]) != __xDPo) ; }
+      | drop([__xSH, __xSI, __xSP, __xSU, __xDI, __xDPo])
+      | join(
+          query={
+              (#event_simpleName=NetworkReceiveAcceptIP4 OR #event_simpleName=NetworkReceiveAcceptIP6)
+              | in(field=#repo.cid, values=[?cid_input])
+              | cidr(LocalIP,  subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+              | cidr(RemoteIP, subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+              // Dest-side INCLUSION filters
+              | ComputerName        =~ wildcard(?{DestHost="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+              | ContextBaseFileName =~ wildcard(?{DestProcess="*"}, ignoreCase=true, includeEverythingOnAsterisk=true)
+              | UserName            =~ wildcard(?{DestUser="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+              // Dest-side EXCLUSION filters
+              | __xDH  := ?{ExcludeDestHost=""}
+              | __xDPr := ?{ExcludeDestProcess=""}
+              | __xDU  := ?{ExcludeDestUser=""}
+              | case { __xDH  = "" ; * | test(ComputerName        != __xDH ) ; }
+              | case { __xDPr = "" ; * | test(ContextBaseFileName != __xDPr) ; }
+              | case { __xDU  = "" ; * | test(UserName            != __xDU ) ; }
+              | drop([__xDH, __xDPr, __xDU])
+              | rename([[aid, DestAid], [ComputerName, DestHost],
+                        [LocalIP, DestLocalIP], [LocalPort, DestLocalPort],
+                        [RemoteIP, DestRemoteIP], [RemotePort, DestRemotePort]])
+              | groupBy([DestRemoteIP, DestRemotePort, DestLocalIP, DestLocalPort],
+                        function=selectLast([DestAid, DestHost]), limit=max)
+          },
+          field=[LocalIP, LocalPort, RemoteIP, RemotePort],
+          key=[DestRemoteIP, DestRemotePort, DestLocalIP, DestLocalPort],
+          include=[DestAid, DestHost],
+          mode=inner, start=1h)
+      | timeChart(span=5m, function=count(as=Connections))
+    end: now
+    start: 1h
+    visualization: time-chart
+    options:
+      connect-points: false
+      imputation: none
+      interpolation: step-after
+      legendPosition: bottom
+      series: {}
+    isLive: false
+
+  # --------------------------------------------------- SANKEY: host flow
+  sankey-host-flow:
+    type: query
+    x: 0
+    y: 12
+    width: 6
+    height: 6
+    title: Source Host → Destination Host
+    queryString: |-
+      (#event_simpleName=NetworkConnectIP4 OR #event_simpleName=NetworkConnectIP6)
+      | in(field=#repo.cid, values=[?cid_input])
+      | cidr(LocalIP,  subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+      | cidr(RemoteIP, subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+      | !cidr(RemoteIP, subnet=["127.0.0.0/8","::1/128"])
+      | test(LocalIP != RemoteIP)
+      // Source-side INCLUSION filters (wildcards: '*' = all, '*sql*' = substring, 'prod-*' = prefix)
+      | ComputerName        =~ wildcard(?{SourceHost="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+      | ContextBaseFileName =~ wildcard(?{SourceProcess="*"}, ignoreCase=true, includeEverythingOnAsterisk=true)
+      | UserName            =~ wildcard(?{SourceUser="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+      | RemotePort          =~ wildcard(?{DestPort="*"},      ignoreCase=true, includeEverythingOnAsterisk=true)
+      // Source-side EXCLUSION filters (single-value, exact match; default '' = exclude nothing)
+      | __xSH  := ?{ExcludeSourceHost=""}
+      | __xSI  := ?{ExcludeSourceIP=""}
+      | __xSP  := ?{ExcludeSourceProcess=""}
+      | __xSU  := ?{ExcludeSourceUser=""}
+      | __xDI  := ?{ExcludeDestIP=""}
+      | __xDPo := ?{ExcludeDestPort=""}
+      | case { __xSH  = "" ; * | test(ComputerName        != __xSH ) ; }
+      | case { __xSI  = "" ; * | test(LocalIP             != __xSI ) ; }
+      | case { __xSP  = "" ; * | test(ContextBaseFileName != __xSP ) ; }
+      | case { __xSU  = "" ; * | test(UserName            != __xSU ) ; }
+      | case { __xDI  = "" ; * | test(RemoteIP            != __xDI ) ; }
+      | case { __xDPo = "" ; * | test(format("%s", field=[RemotePort]) != __xDPo) ; }
+      | drop([__xSH, __xSI, __xSP, __xSU, __xDI, __xDPo])
+      | SourceHost := ComputerName
+      | join(
+          query={
+              (#event_simpleName=NetworkReceiveAcceptIP4 OR #event_simpleName=NetworkReceiveAcceptIP6)
+              | in(field=#repo.cid, values=[?cid_input])
+              | cidr(LocalIP,  subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+              | cidr(RemoteIP, subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+              // Dest-side INCLUSION filters
+              | ComputerName        =~ wildcard(?{DestHost="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+              | ContextBaseFileName =~ wildcard(?{DestProcess="*"}, ignoreCase=true, includeEverythingOnAsterisk=true)
+              | UserName            =~ wildcard(?{DestUser="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+              // Dest-side EXCLUSION filters
+              | __xDH  := ?{ExcludeDestHost=""}
+              | __xDPr := ?{ExcludeDestProcess=""}
+              | __xDU  := ?{ExcludeDestUser=""}
+              | case { __xDH  = "" ; * | test(ComputerName        != __xDH ) ; }
+              | case { __xDPr = "" ; * | test(ContextBaseFileName != __xDPr) ; }
+              | case { __xDU  = "" ; * | test(UserName            != __xDU ) ; }
+              | drop([__xDH, __xDPr, __xDU])
+              | rename([[aid, DestAid], [ComputerName, DestHost],
+                        [LocalIP, DestLocalIP], [LocalPort, DestLocalPort],
+                        [RemoteIP, DestRemoteIP], [RemotePort, DestRemotePort]])
+              | groupBy([DestRemoteIP, DestRemotePort, DestLocalIP, DestLocalPort],
+                        function=selectLast([DestAid, DestHost]), limit=max)
+          },
+          field=[LocalIP, LocalPort, RemoteIP, RemotePort],
+          key=[DestRemoteIP, DestRemotePort, DestLocalIP, DestLocalPort],
+          include=[DestAid, DestHost],
+          mode=inner, start=1h)
+      | top([SourceHost, DestHost], limit=200)
+      | sankey(source="SourceHost", target="DestHost")
+    end: now
+    start: 1h
+    visualization: sankey
+    options: {}
+    isLive: false
+
+  # -------------------------------------------- BAR CHART: top dest ports
+  bar-top-dest-ports:
+    type: query
+    x: 6
+    y: 12
+    width: 6
+    height: 6
+    title: Top Destination Ports
+    queryString: |-
+      (#event_simpleName=NetworkConnectIP4 OR #event_simpleName=NetworkConnectIP6)
+      | in(field=#repo.cid, values=[?cid_input])
+      | cidr(LocalIP,  subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+      | cidr(RemoteIP, subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+      | !cidr(RemoteIP, subnet=["127.0.0.0/8","::1/128"])
+      | test(LocalIP != RemoteIP)
+      // Source-side INCLUSION filters (wildcards: '*' = all, '*sql*' = substring, 'prod-*' = prefix)
+      | ComputerName        =~ wildcard(?{SourceHost="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+      | ContextBaseFileName =~ wildcard(?{SourceProcess="*"}, ignoreCase=true, includeEverythingOnAsterisk=true)
+      | UserName            =~ wildcard(?{SourceUser="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+      | RemotePort          =~ wildcard(?{DestPort="*"},      ignoreCase=true, includeEverythingOnAsterisk=true)
+      // Source-side EXCLUSION filters (single-value, exact match; default '' = exclude nothing)
+      | __xSH  := ?{ExcludeSourceHost=""}
+      | __xSI  := ?{ExcludeSourceIP=""}
+      | __xSP  := ?{ExcludeSourceProcess=""}
+      | __xSU  := ?{ExcludeSourceUser=""}
+      | __xDI  := ?{ExcludeDestIP=""}
+      | __xDPo := ?{ExcludeDestPort=""}
+      | case { __xSH  = "" ; * | test(ComputerName        != __xSH ) ; }
+      | case { __xSI  = "" ; * | test(LocalIP             != __xSI ) ; }
+      | case { __xSP  = "" ; * | test(ContextBaseFileName != __xSP ) ; }
+      | case { __xSU  = "" ; * | test(UserName            != __xSU ) ; }
+      | case { __xDI  = "" ; * | test(RemoteIP            != __xDI ) ; }
+      | case { __xDPo = "" ; * | test(format("%s", field=[RemotePort]) != __xDPo) ; }
+      | drop([__xSH, __xSI, __xSP, __xSU, __xDI, __xDPo])
+      | join(
+          query={
+              (#event_simpleName=NetworkReceiveAcceptIP4 OR #event_simpleName=NetworkReceiveAcceptIP6)
+              | in(field=#repo.cid, values=[?cid_input])
+              | cidr(LocalIP,  subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+              | cidr(RemoteIP, subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+              // Dest-side INCLUSION filters
+              | ComputerName        =~ wildcard(?{DestHost="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+              | ContextBaseFileName =~ wildcard(?{DestProcess="*"}, ignoreCase=true, includeEverythingOnAsterisk=true)
+              | UserName            =~ wildcard(?{DestUser="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+              // Dest-side EXCLUSION filters
+              | __xDH  := ?{ExcludeDestHost=""}
+              | __xDPr := ?{ExcludeDestProcess=""}
+              | __xDU  := ?{ExcludeDestUser=""}
+              | case { __xDH  = "" ; * | test(ComputerName        != __xDH ) ; }
+              | case { __xDPr = "" ; * | test(ContextBaseFileName != __xDPr) ; }
+              | case { __xDU  = "" ; * | test(UserName            != __xDU ) ; }
+              | drop([__xDH, __xDPr, __xDU])
+              | rename([[aid, DestAid], [ComputerName, DestHost],
+                        [LocalIP, DestLocalIP], [LocalPort, DestLocalPort],
+                        [RemoteIP, DestRemoteIP], [RemotePort, DestRemotePort]])
+              | groupBy([DestRemoteIP, DestRemotePort, DestLocalIP, DestLocalPort],
+                        function=selectLast([DestAid, DestHost]), limit=max)
+          },
+          field=[LocalIP, LocalPort, RemoteIP, RemotePort],
+          key=[DestRemoteIP, DestRemotePort, DestLocalIP, DestLocalPort],
+          include=[DestAid, DestHost],
+          mode=inner, start=1h)
+      | top(RemotePort, limit=20)
+    end: now
+    start: 1h
+    visualization: bar-chart
+    options:
+      legendPosition: bottom
+      series: {}
+    isLive: false
+
+  # ---------------------------------------- BAR CHART: top source processes
+  bar-top-source-processes:
+    type: query
+    x: 0
+    y: 18
+    width: 6
+    height: 5
+    title: Top Source Processes
+    queryString: |-
+      (#event_simpleName=NetworkConnectIP4 OR #event_simpleName=NetworkConnectIP6)
+      | in(field=#repo.cid, values=[?cid_input])
+      | cidr(LocalIP,  subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+      | cidr(RemoteIP, subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+      | !cidr(RemoteIP, subnet=["127.0.0.0/8","::1/128"])
+      | test(LocalIP != RemoteIP)
+      // Source-side INCLUSION filters (wildcards: '*' = all, '*sql*' = substring, 'prod-*' = prefix)
+      | ComputerName        =~ wildcard(?{SourceHost="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+      | ContextBaseFileName =~ wildcard(?{SourceProcess="*"}, ignoreCase=true, includeEverythingOnAsterisk=true)
+      | UserName            =~ wildcard(?{SourceUser="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+      | RemotePort          =~ wildcard(?{DestPort="*"},      ignoreCase=true, includeEverythingOnAsterisk=true)
+      // Source-side EXCLUSION filters (single-value, exact match; default '' = exclude nothing)
+      | __xSH  := ?{ExcludeSourceHost=""}
+      | __xSI  := ?{ExcludeSourceIP=""}
+      | __xSP  := ?{ExcludeSourceProcess=""}
+      | __xSU  := ?{ExcludeSourceUser=""}
+      | __xDI  := ?{ExcludeDestIP=""}
+      | __xDPo := ?{ExcludeDestPort=""}
+      | case { __xSH  = "" ; * | test(ComputerName        != __xSH ) ; }
+      | case { __xSI  = "" ; * | test(LocalIP             != __xSI ) ; }
+      | case { __xSP  = "" ; * | test(ContextBaseFileName != __xSP ) ; }
+      | case { __xSU  = "" ; * | test(UserName            != __xSU ) ; }
+      | case { __xDI  = "" ; * | test(RemoteIP            != __xDI ) ; }
+      | case { __xDPo = "" ; * | test(format("%s", field=[RemotePort]) != __xDPo) ; }
+      | drop([__xSH, __xSI, __xSP, __xSU, __xDI, __xDPo])
+      | SourceProcess := ContextBaseFileName
+      | join(
+          query={
+              (#event_simpleName=NetworkReceiveAcceptIP4 OR #event_simpleName=NetworkReceiveAcceptIP6)
+              | in(field=#repo.cid, values=[?cid_input])
+              | cidr(LocalIP,  subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+              | cidr(RemoteIP, subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+              // Dest-side INCLUSION filters
+              | ComputerName        =~ wildcard(?{DestHost="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+              | ContextBaseFileName =~ wildcard(?{DestProcess="*"}, ignoreCase=true, includeEverythingOnAsterisk=true)
+              | UserName            =~ wildcard(?{DestUser="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+              // Dest-side EXCLUSION filters
+              | __xDH  := ?{ExcludeDestHost=""}
+              | __xDPr := ?{ExcludeDestProcess=""}
+              | __xDU  := ?{ExcludeDestUser=""}
+              | case { __xDH  = "" ; * | test(ComputerName        != __xDH ) ; }
+              | case { __xDPr = "" ; * | test(ContextBaseFileName != __xDPr) ; }
+              | case { __xDU  = "" ; * | test(UserName            != __xDU ) ; }
+              | drop([__xDH, __xDPr, __xDU])
+              | rename([[aid, DestAid], [ComputerName, DestHost],
+                        [LocalIP, DestLocalIP], [LocalPort, DestLocalPort],
+                        [RemoteIP, DestRemoteIP], [RemotePort, DestRemotePort]])
+              | groupBy([DestRemoteIP, DestRemotePort, DestLocalIP, DestLocalPort],
+                        function=selectLast([DestAid, DestHost]), limit=max)
+          },
+          field=[LocalIP, LocalPort, RemoteIP, RemotePort],
+          key=[DestRemoteIP, DestRemotePort, DestLocalIP, DestLocalPort],
+          include=[DestAid, DestHost],
+          mode=inner, start=1h)
+      | top(SourceProcess, limit=20)
+    end: now
+    start: 1h
+    visualization: bar-chart
+    options:
+      legendPosition: bottom
+      series: {}
+    isLive: false
+
+  # ------------------------------------------ BAR CHART: top dest processes
+  bar-top-dest-processes:
+    type: query
+    x: 6
+    y: 18
+    width: 6
+    height: 5
+    title: Top Destination Processes
+    queryString: |-
+      (#event_simpleName=NetworkConnectIP4 OR #event_simpleName=NetworkConnectIP6)
+      | in(field=#repo.cid, values=[?cid_input])
+      | cidr(LocalIP,  subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+      | cidr(RemoteIP, subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+      | !cidr(RemoteIP, subnet=["127.0.0.0/8","::1/128"])
+      | test(LocalIP != RemoteIP)
+      // Source-side INCLUSION filters (wildcards: '*' = all, '*sql*' = substring, 'prod-*' = prefix)
+      | ComputerName        =~ wildcard(?{SourceHost="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+      | ContextBaseFileName =~ wildcard(?{SourceProcess="*"}, ignoreCase=true, includeEverythingOnAsterisk=true)
+      | UserName            =~ wildcard(?{SourceUser="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+      | RemotePort          =~ wildcard(?{DestPort="*"},      ignoreCase=true, includeEverythingOnAsterisk=true)
+      // Source-side EXCLUSION filters (single-value, exact match; default '' = exclude nothing)
+      | __xSH  := ?{ExcludeSourceHost=""}
+      | __xSI  := ?{ExcludeSourceIP=""}
+      | __xSP  := ?{ExcludeSourceProcess=""}
+      | __xSU  := ?{ExcludeSourceUser=""}
+      | __xDI  := ?{ExcludeDestIP=""}
+      | __xDPo := ?{ExcludeDestPort=""}
+      | case { __xSH  = "" ; * | test(ComputerName        != __xSH ) ; }
+      | case { __xSI  = "" ; * | test(LocalIP             != __xSI ) ; }
+      | case { __xSP  = "" ; * | test(ContextBaseFileName != __xSP ) ; }
+      | case { __xSU  = "" ; * | test(UserName            != __xSU ) ; }
+      | case { __xDI  = "" ; * | test(RemoteIP            != __xDI ) ; }
+      | case { __xDPo = "" ; * | test(format("%s", field=[RemotePort]) != __xDPo) ; }
+      | drop([__xSH, __xSI, __xSP, __xSU, __xDI, __xDPo])
+      | join(
+          query={
+              (#event_simpleName=NetworkReceiveAcceptIP4 OR #event_simpleName=NetworkReceiveAcceptIP6)
+              | in(field=#repo.cid, values=[?cid_input])
+              | cidr(LocalIP,  subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+              | cidr(RemoteIP, subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+              // Dest-side INCLUSION filters
+              | ComputerName        =~ wildcard(?{DestHost="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+              | ContextBaseFileName =~ wildcard(?{DestProcess="*"}, ignoreCase=true, includeEverythingOnAsterisk=true)
+              | UserName            =~ wildcard(?{DestUser="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+              // Dest-side EXCLUSION filters
+              | __xDH  := ?{ExcludeDestHost=""}
+              | __xDPr := ?{ExcludeDestProcess=""}
+              | __xDU  := ?{ExcludeDestUser=""}
+              | case { __xDH  = "" ; * | test(ComputerName        != __xDH ) ; }
+              | case { __xDPr = "" ; * | test(ContextBaseFileName != __xDPr) ; }
+              | case { __xDU  = "" ; * | test(UserName            != __xDU ) ; }
+              | drop([__xDH, __xDPr, __xDU])
+              | rename([[aid, DestAid], [ComputerName, DestHost],
+                        [LocalIP, DestLocalIP], [LocalPort, DestLocalPort],
+                        [RemoteIP, DestRemoteIP], [RemotePort, DestRemotePort],
+                        [ContextBaseFileName, DestProcess]])
+              | groupBy([DestRemoteIP, DestRemotePort, DestLocalIP, DestLocalPort],
+                        function=selectLast([DestAid, DestHost, DestProcess]), limit=max)
+          },
+          field=[LocalIP, LocalPort, RemoteIP, RemotePort],
+          key=[DestRemoteIP, DestRemotePort, DestLocalIP, DestLocalPort],
+          include=[DestAid, DestHost, DestProcess],
+          mode=inner, start=1h)
+      | top(DestProcess, limit=20)
+    end: now
+    start: 1h
+    visualization: bar-chart
+    options:
+      legendPosition: bottom
+      series: {}
+    isLive: false
+
+  # --------------------------------------- TABLE: full connection details
+  table-connection-details:
+    type: query
+    x: 0
+    y: 23
+    width: 12
+    height: 8
+    title: Connection Details
+    queryString: |-
+      (#event_simpleName=NetworkConnectIP4 OR #event_simpleName=NetworkConnectIP6)
+      | in(field=#repo.cid, values=[?cid_input])
+      | cidr(LocalIP,  subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+      | cidr(RemoteIP, subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+      | !cidr(RemoteIP, subnet=["127.0.0.0/8","::1/128"])
+      | test(LocalIP != RemoteIP)
+      // Source-side INCLUSION filters (wildcards: '*' = all, '*sql*' = substring, 'prod-*' = prefix)
+      | ComputerName        =~ wildcard(?{SourceHost="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+      | ContextBaseFileName =~ wildcard(?{SourceProcess="*"}, ignoreCase=true, includeEverythingOnAsterisk=true)
+      | UserName            =~ wildcard(?{SourceUser="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+      | RemotePort          =~ wildcard(?{DestPort="*"},      ignoreCase=true, includeEverythingOnAsterisk=true)
+      // Source-side EXCLUSION filters (single-value, exact match; default '' = exclude nothing)
+      | __xSH  := ?{ExcludeSourceHost=""}
+      | __xSI  := ?{ExcludeSourceIP=""}
+      | __xSP  := ?{ExcludeSourceProcess=""}
+      | __xSU  := ?{ExcludeSourceUser=""}
+      | __xDI  := ?{ExcludeDestIP=""}
+      | __xDPo := ?{ExcludeDestPort=""}
+      | case { __xSH  = "" ; * | test(ComputerName        != __xSH ) ; }
+      | case { __xSI  = "" ; * | test(LocalIP             != __xSI ) ; }
+      | case { __xSP  = "" ; * | test(ContextBaseFileName != __xSP ) ; }
+      | case { __xSU  = "" ; * | test(UserName            != __xSU ) ; }
+      | case { __xDI  = "" ; * | test(RemoteIP            != __xDI ) ; }
+      | case { __xDPo = "" ; * | test(format("%s", field=[RemotePort]) != __xDPo) ; }
+      | drop([__xSH, __xSI, __xSP, __xSU, __xDI, __xDPo])
+      | SourceAid       := aid
+      | SourceHost      := ComputerName
+      | SourceUser      := UserName
+      | SourceProcess   := ContextBaseFileName
+      | SourceProcessId := ContextProcessId
+      | join(
+          query={
+              (#event_simpleName=NetworkReceiveAcceptIP4 OR #event_simpleName=NetworkReceiveAcceptIP6)
+              | in(field=#repo.cid, values=[?cid_input])
+              | cidr(LocalIP,  subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+              | cidr(RemoteIP, subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+              // Dest-side INCLUSION filters
+              | ComputerName        =~ wildcard(?{DestHost="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+              | ContextBaseFileName =~ wildcard(?{DestProcess="*"}, ignoreCase=true, includeEverythingOnAsterisk=true)
+              | UserName            =~ wildcard(?{DestUser="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+              // Dest-side EXCLUSION filters
+              | __xDH  := ?{ExcludeDestHost=""}
+              | __xDPr := ?{ExcludeDestProcess=""}
+              | __xDU  := ?{ExcludeDestUser=""}
+              | case { __xDH  = "" ; * | test(ComputerName        != __xDH ) ; }
+              | case { __xDPr = "" ; * | test(ContextBaseFileName != __xDPr) ; }
+              | case { __xDU  = "" ; * | test(UserName            != __xDU ) ; }
+              | drop([__xDH, __xDPr, __xDU])
+              | rename([[aid, DestAid], [ComputerName, DestHost], [UserName, DestUser],
+                        [LocalIP, DestLocalIP], [LocalPort, DestLocalPort],
+                        [RemoteIP, DestRemoteIP], [RemotePort, DestRemotePort],
+                        [ContextBaseFileName, DestProcess], [ContextProcessId, DestProcessId]])
+              | groupBy([DestRemoteIP, DestRemotePort, DestLocalIP, DestLocalPort],
+                        function=selectLast([DestAid, DestHost, DestUser, DestProcess, DestProcessId]),
+                        limit=max)
+          },
+          field=[LocalIP, LocalPort, RemoteIP, RemotePort],
+          key=[DestRemoteIP, DestRemotePort, DestLocalIP, DestLocalPort],
+          include=[DestAid, DestHost, DestUser, DestProcess, DestProcessId],
+          mode=inner, start=1h)
+      | groupBy([SourceHost, SourceAid, SourceUser, SourceProcess, SourceProcessId,
+                 LocalIP, LocalPort, RemoteIP, RemotePort,
+                 DestHost, DestAid, DestUser, DestProcess, DestProcessId],
+            function=([count(as=ConnectionCount),
+                       min(@timestamp, as=FirstSeen),
+                       max(@timestamp, as=LastSeen)]),
+            limit=max)
+      | formatTime(format="%F %T", field=FirstSeen, as=FirstSeen)
+      | formatTime(format="%F %T", field=LastSeen,  as=LastSeen)
+      | default(field=[SourceUser, DestUser], value="-", replaceEmpty=true)
+      | "Source Process Explorer" := format("[Investigate](https://falcon.crowdstrike.com/investigate/process-explorer/%s/%s)", field=[SourceAid, SourceProcessId])
+      | "Dest Process Explorer"   := format("[Investigate](https://falcon.crowdstrike.com/investigate/process-explorer/%s/%s)", field=[DestAid, DestProcessId])
+      | table([SourceHost, SourceAid, SourceUser, SourceProcess, SourceProcessId,
+               LocalIP, LocalPort, RemoteIP, RemotePort,
+               DestHost, DestAid, DestUser, DestProcess, DestProcessId,
+               ConnectionCount, FirstSeen, LastSeen,
+               "Source Process Explorer", "Dest Process Explorer"],
+              sortby=ConnectionCount, order=desc, limit=20000)
+    end: now
+    start: 1h
+    visualization: table-view
+    options:
+      cell-overflow: wrap-text
+      row-numbers-enabled: false
+      configured-columns:
+        SourceHost:
+          color: '#126cc6'
+          render-as: value
+        DestHost:
+          color: '#126cc6'
+          render-as: value
+        SourceProcess:
+          render-as: value
+        DestProcess:
+          render-as: value
+        ConnectionCount:
+          render-as: value
+          color:
+            defaultColor: '#29a34b'
+            thresholds:
+              - { color: '#f9e686', value: 50 }
+              - { color: '#f59464', value: 200 }
+              - { color: '#f15249', value: 1000 }
+        "Source Process Explorer":
+          render-as: link
+        "Dest Process Explorer":
+          render-as: link
+    isLive: false
+    interactions:
+      - name: filterClick
+        titleTemplate: "Pivot: {{ fields.SourceHost }} → {{ fields.DestHost }}"
+        queryString: |-
+          (#event_simpleName=NetworkConnectIP4 OR #event_simpleName=NetworkConnectIP6)
+          | in(field=#repo.cid, values=[?cid_input])
+          | input.aid := ?source_aid
+          | input.aid = /\[(?<input.aid>.+?)\]/F
+          | input.pid := ?source_pid
+          | input.pid = /\[(?<input.pid>.+?)\]/F
+          | input.ip := ?dest_ip
+          | input.ip = /\[(?<input.ip>.+?)\]/F
+          | input.port := ?dest_port
+          | input.port = /\[(?<input.port>.+?)\]/F
+          | test(aid == input.aid)
+          | test(ContextProcessId == input.pid)
+          | test(RemoteIP == input.ip)
+          | test(RemotePort == input.port)
+          | drop([input.aid, input.pid, input.ip, input.port])
+        useWidgetTimeWindow: true
+        arguments:
+          cid_input:  '["{{ parameters.cid_input }}"]'
+          source_aid: '["{{ fields.SourceAid }}"]'
+          source_pid: '["{{ fields.SourceProcessId }}"]'
+          dest_ip:    '["{{ fields.RemoteIP }}"]'
+          dest_port:  '["{{ fields.RemotePort }}"]'
+        openInNewTab: true
+        isLive: false
+        type: searchlink
+
+  # ----------------------------- TABLE: unsensored internal target hosts
+  # Uses mode=left and keeps only rows where the join missed (DestHost!=*),
+  # surfacing internal IP:port pairs that received traffic but had no
+  # corresponding NetworkReceiveAcceptIP4/6 event — i.e., no sensor present.
+  # NOTE: Dest* parameter filters are intentionally NOT applied — unsensored
+  # destinations have no DestHost / DestProcess / DestUser to filter on.
+  table-unsensored-targets:
+    type: query
+    x: 0
+    y: 31
+    width: 12
+    height: 6
+    title: Connections to Unsensored Internal Hosts (Coverage Gaps)
+    queryString: |-
+      (#event_simpleName=NetworkConnectIP4 OR #event_simpleName=NetworkConnectIP6)
+      | in(field=#repo.cid, values=[?cid_input])
+      | cidr(LocalIP,  subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+      | cidr(RemoteIP, subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+      | !cidr(RemoteIP, subnet=["127.0.0.0/8","::1/128"])
+      | test(LocalIP != RemoteIP)
+      // Source-side filters apply; Dest* filters intentionally do not
+      // Source-side INCLUSION filters (wildcards: '*' = all, '*sql*' = substring, 'prod-*' = prefix)
+      | ComputerName        =~ wildcard(?{SourceHost="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+      | ContextBaseFileName =~ wildcard(?{SourceProcess="*"}, ignoreCase=true, includeEverythingOnAsterisk=true)
+      | UserName            =~ wildcard(?{SourceUser="*"},    ignoreCase=true, includeEverythingOnAsterisk=true)
+      | RemotePort          =~ wildcard(?{DestPort="*"},      ignoreCase=true, includeEverythingOnAsterisk=true)
+      // Source-side EXCLUSION filters (single-value, exact match; default '' = exclude nothing)
+      | __xSH  := ?{ExcludeSourceHost=""}
+      | __xSI  := ?{ExcludeSourceIP=""}
+      | __xSP  := ?{ExcludeSourceProcess=""}
+      | __xSU  := ?{ExcludeSourceUser=""}
+      | __xDI  := ?{ExcludeDestIP=""}
+      | __xDPo := ?{ExcludeDestPort=""}
+      | case { __xSH  = "" ; * | test(ComputerName        != __xSH ) ; }
+      | case { __xSI  = "" ; * | test(LocalIP             != __xSI ) ; }
+      | case { __xSP  = "" ; * | test(ContextBaseFileName != __xSP ) ; }
+      | case { __xSU  = "" ; * | test(UserName            != __xSU ) ; }
+      | case { __xDI  = "" ; * | test(RemoteIP            != __xDI ) ; }
+      | case { __xDPo = "" ; * | test(format("%s", field=[RemotePort]) != __xDPo) ; }
+      | drop([__xSH, __xSI, __xSP, __xSU, __xDI, __xDPo])
+      | SourceHost    := ComputerName
+      | SourceProcess := ContextBaseFileName
+      | join(
+          query={
+              (#event_simpleName=NetworkReceiveAcceptIP4 OR #event_simpleName=NetworkReceiveAcceptIP6)
+              | in(field=#repo.cid, values=[?cid_input])
+              | cidr(LocalIP,  subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+              | cidr(RemoteIP, subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","fd00::/8"])
+              | rename([[aid, DestAid], [ComputerName, DestHost],
+                        [LocalIP, DestLocalIP], [LocalPort, DestLocalPort],
+                        [RemoteIP, DestRemoteIP], [RemotePort, DestRemotePort]])
+              | groupBy([DestRemoteIP, DestRemotePort, DestLocalIP, DestLocalPort],
+                        function=selectLast([DestAid, DestHost]), limit=max)
+          },
+          field=[LocalIP, LocalPort, RemoteIP, RemotePort],
+          key=[DestRemoteIP, DestRemotePort, DestLocalIP, DestLocalPort],
+          include=[DestAid, DestHost],
+          mode=left, start=1h)
+      // Keep only rows where the join missed — destination is unsensored
+      | DestHost!=*
+      | groupBy([RemoteIP, RemotePort],
+            function=([count(as=ConnectionCount),
+                       count(SourceHost,    distinct=true, as=DistinctSourceHosts),
+                       count(SourceProcess, distinct=true, as=DistinctSourceProcesses),
+                       collect([SourceHost],    separator=", ", limit=20),
+                       collect([SourceProcess], separator=", ", limit=20),
+                       min(@timestamp, as=FirstSeen),
+                       max(@timestamp, as=LastSeen)]),
+            limit=max)
+      | rename([[SourceHost, SourceHosts], [SourceProcess, SourceProcesses]])
+      | formatTime(format="%F %T", field=FirstSeen, as=FirstSeen)
+      | formatTime(format="%F %T", field=LastSeen,  as=LastSeen)
+      | table([RemoteIP, RemotePort, DistinctSourceHosts, DistinctSourceProcesses,
+               ConnectionCount, SourceHosts, SourceProcesses, FirstSeen, LastSeen],
+              sortby=DistinctSourceHosts, order=desc, limit=10000)
+    end: now
+    start: 1h
+    visualization: table-view
+    options:
+      cell-overflow: wrap-text
+      row-numbers-enabled: false
+      configured-columns:
+        RemoteIP:
+          color: '#C93637'
+          render-as: value
+        RemotePort:
+          render-as: value
+        DistinctSourceHosts:
+          render-as: value
+          color:
+            defaultColor: '#29a34b'
+            thresholds:
+              - { color: '#f9e686', value: 5 }
+              - { color: '#f59464', value: 20 }
+              - { color: '#f15249', value: 50 }
+        DistinctSourceProcesses:
+          render-as: value
+        ConnectionCount:
+          render-as: value
+    isLive: false
+    interactions:
+      - name: filterClick
+        titleTemplate: "Sources contacting {{ fields.RemoteIP }}:{{ fields.RemotePort }}"
+        queryString: |-
+          (#event_simpleName=NetworkConnectIP4 OR #event_simpleName=NetworkConnectIP6)
+          | in(field=#repo.cid, values=[?cid_input])
+          | input.ip := ?dest_ip
+          | input.ip = /\[(?<input.ip>.+?)\]/F
+          | input.port := ?dest_port
+          | input.port = /\[(?<input.port>.+?)\]/F
+          | test(RemoteIP == input.ip)
+          | test(RemotePort == input.port)
+          | drop([input.ip, input.port])
+        useWidgetTimeWindow: true
+        arguments:
+          cid_input: '["{{ parameters.cid_input }}"]'
+          dest_ip:   '["{{ fields.RemoteIP }}"]'
+          dest_port: '["{{ fields.RemotePort }}"]'
+        openInNewTab: true
+        isLive: false
+        type: searchlink
