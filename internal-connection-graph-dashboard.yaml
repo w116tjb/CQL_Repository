@@ -7,13 +7,6 @@ sharedTimeInterval:
   isLive: false
   start: 1h
 
-# ==============================================================================
-# PARAMETERS
-# ==============================================================================
-# Wildcard text parameters use `type: text`. If your tenant's Humio/LogScale
-# build doesn't accept `text`, swap to `type: list` with a small `values:` set.
-# All wildcard fields default to "*" (match everything).
-# ==============================================================================
 parameters:
   cid_input:
     label: CID
